@@ -1,176 +1,140 @@
-#include <stdio.h>
-#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_log.h"
 
-// ========================================
-// PINES ORIGINALES MANTENIDOS
-// ========================================
-#define BTN_GUARDAR GPIO_NUM_8
+#include "ntc.h"
+#include "rgb.h"
+#include "uart_manager.h"
 
-#define R1 GPIO_NUM_2
-#define G1 GPIO_NUM_3
-#define B1 GPIO_NUM_4
+#define TAG "MAIN"
 
-#define R2 GPIO_NUM_5
-#define G2 GPIO_NUM_6
-#define B2 GPIO_NUM_7
+#define BTN_PIN   GPIO_NUM_8
+#define R1        GPIO_NUM_2
+#define G1        GPIO_NUM_3
+#define B1        GPIO_NUM_4
+#define R2        GPIO_NUM_5
+#define G2        GPIO_NUM_6
+#define B2        GPIO_NUM_7
+#define CH_NTC    ADC_CHANNEL_0
+#define CH_POT    ADC_CHANNEL_1
 
-#define ADC_NTC ADC_CHANNEL_0  // GPIO 0
-#define ADC_POT ADC_CHANNEL_1  // GPIO 1
+#define DEFAULT_INTERVAL_S  5
+#define TICK_MS             30
 
-// Handle para el ADC
-adc_oneshot_unit_handle_t adc_handle;
+static float convertir(float c, temp_unit_t u)
+{
+    if (u == UNIT_FAHRENHEIT) return c * 9.0f / 5.0f + 32.0f;
+    if (u == UNIT_KELVIN)     return c + 273.15f;
+    return c;
+}
 
-// Variables globales para el Mezclador (LED 2)
-float r_save = 0, g_save = 0, b_save = 0;
-int paso = 0; 
+static const char *unidad_str(temp_unit_t u)
+{
+    if (u == UNIT_FAHRENHEIT) return "F";
+    if (u == UNIT_KELVIN)     return "K";
+    return "C";
+}
+                                //handle es un puntero a una estructura que representa la unidad ADC configurada previamente, y ch es el canal ADC específico que se va a leer para obtener la temperatura en grados Celsius. La función devuelve un valor de tipo float que representa la temperatura medida por el sensor NTC en grados Celsius, utilizando la configuración del ADC para realizar la lectura y conversión adecuada.
+void app_main(void)
+{
+    // ADC                              &configuracion
+    adc_oneshot_unit_handle_t adc;                          // adc es un manejador para la unidad ADC configurada previamente, que se utiliza para realizar lecturas de los canales ADC asociados al sensor NTC y al potenciómetro. Este manejador se inicializa con la configuración adecuada para el ADC y se utiliza posteriormente para leer los valores de temperatura y umbral de temperatura en el bucle principal del programa.
+    adc_oneshot_unit_init_cfg_t adc_init = { .unit_id = ADC_UNIT_1 };
+    adc_oneshot_new_unit(&adc_init, &adc);      
 
-// ========================================
-// CONFIGURACIÓN DE PERIFÉRICOS
-// ========================================
+    adc_oneshot_chan_cfg_t adc_cfg = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
+    adc_oneshot_config_channel(adc, CH_NTC, &adc_cfg);
+    adc_oneshot_config_channel(adc, CH_POT, &adc_cfg);
+    ntc_init(adc, CH_NTC);
 
-void pwm_init() {
-    ledc_timer_config_t timer = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = LEDC_TIMER_0,
-        .duty_resolution = LEDC_TIMER_13_BIT,
-        .freq_hz = 5000,
-        .clk_cfg = LEDC_AUTO_CLK
+    // LEDs
+    int pines[6] = { R1, G1, B1, R2, G2, B2 };    //define los pines de pwm
+    rgb_init(pines);
+
+    // confiugracion del  Botón
+    gpio_config_t btn_cfg = {               //btn_cfg es una estructura que contiene la configuración para el pin del botón, incluyendo el modo de operación (entrada), la máscara de bits para seleccionar el pin específico y la habilitación de la resistencia pull-up interna. Esta configuración se utiliza para configurar el pin del botón como una entrada con resistencia pull-up, lo que permite detectar cuándo se presiona el botón al leer un nivel lógico bajo en el pin correspondiente.
+        .mode         = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BTN_PIN),    //pin_bit_mask es una máscara de bits que se utiliza para seleccionar el pin específico del botón que se va a configurar. En este caso, se utiliza un desplazamiento de bits (1ULL << BTN_PIN) para crear una máscara que tiene un bit establecido en la posición correspondiente al número de pin del botón, lo que permite configurar solo ese pin como entrada.  
+        .pull_up_en   = GPIO_PULLUP_ENABLE
     };
-    ledc_timer_config(&timer);
+    gpio_config(&btn_cfg);
 
-    // Configurar los 6 pines (LED 1 y LED 2)
-    int pines[6] = {R1, G1, B1, R2, G2, B2};
-    for(int i = 0; i < 6; i++) {
-        ledc_channel_config_t ch = {
-            .gpio_num = pines[i],
-            .speed_mode = LEDC_LOW_SPEED_MODE,
-            .channel = i, // Canales 0,1,2 para LED1 | Canales 3,4,5 para LED2
-            .timer_sel = LEDC_TIMER_0,
-            .duty = 0
-        };
-        ledc_channel_config(&ch);
-    }
-}
+    // Config global — sin pot_threshold
+    system_config_t config = {
+        .red   = { .min = 35.0f,  .max = 100.0f, .intensity = 255 },
+        .green = { .min = 25.0f,  .max = 35.0f,  .intensity = 255 },
+        .blue  = { .min = -40.0f, .max = 25.0f,  .intensity = 255 },
+        .unit             = UNIT_CELSIUS,
+        .print_interval_s = DEFAULT_INTERVAL_S,            // Intervalo de impresión en segundos
+        .mutex            = xSemaphoreCreateMutex()        // Crea un mutex para proteger el acceso a la configuración del sistema, asegurando que solo una tarea pueda modificar la configuración a la vez, evitando condiciones de carrera y garantizando la integridad de los datos cuando se accede o modifica la configuración desde diferentes partes del programa.
+    };
 
-// Control de color para el LED 1 (Canales 0, 1, 2)
-// MODIFICADO: Inversión de lógica para LED de Ánodo Común
-void set_led1_temperatura(float r, float g, float b) {
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, 0, (1.0 - r) * 8191);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, 0);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, 1, (1.0 - g) * 8191);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, 1);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, 2, (1.0 - b) * 8191);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, 2);
-}
+    uart_init();
+    xTaskCreate(uart_task, "uart", 4096, &config, 5, NULL);
 
-// Control de color para el LED 2 (Canales 3, 4, 5) - SIN CAMBIOS
-void set_led2_mezclador(float r, float g, float b) {
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, 3, r * 8191);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, 3);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, 4, g * 8191);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, 4);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, 5, b * 8191);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, 5);
-}
+    ESP_LOGI(TAG, "Sistema listo");
 
-// Lectura del sensor de temperatura NTC
-float leer_temperatura() {
-    int adc = 0;
-    // Si se congela aquí, el problema es que el ADC no responde
-    adc_oneshot_read(adc_handle, ADC_NTC, &adc);
+    int      last_btn  = 1;             //guarda el estado anterior del botón para detectar cambios de estado (presión y liberación), lo que permite implementar la funcionalidad de ciclar entre las unidades de temperatura (Celsius, Fahrenheit, Kelvin) cada vez que se presiona el botón, asegurando que la acción solo se realice una vez por cada pulsación del botón.
+    uint32_t ticks_log = 0;             //ticks_log es una variable que se utiliza para llevar un registro del tiempo transcurrido desde la última vez que se imprimió la temperatura en el log.       
 
-    // IMPRESIÓN DE DIAGNÓSTICO: Ver el valor crudo del sensor
-    printf("Lectura ADC Cruda: %d\n", adc);
+    while (1) {                         //mutex para cuando deja de enviar el comando 
+        // 1. Temperatura
+        float tc = ntc_leer_celsius(adc, CH_NTC);
 
-    // ESCUDO PROTECTOR: Evita que el ESP32 se congele por errores matemáticos
-    if (adc <= 10 || adc >= 4080) {
-        printf("[ALERTA] Sensor NTC mal conectado o en corto. Revisa cables.\n");
-        return 25.0; // Retorna temperatura ficticia para que no se trabe el LED
-    }
+        // 2. LED1 — color según rango de temperatura
+        xSemaphoreTake(config.mutex, portMAX_DELAY); // Se toma el mutex para proteger el acceso a la configuración del sistema, se leen los rangos de temperatura y las intensidades de color para cada LED desde la configuración, y luego se libera el mutex para permitir que otras partes del programa accedan a la configuración de manera segura. Luego, se utiliza la temperatura medida (tc) para determinar el color del LED1 según los rangos configurados, estableciendo la intensidad de cada color (rojo, verde, azul) en función de si la temperatura está por debajo del rango verde, dentro del rango verde o por encima del rango rojo.
+        float gmin = config.green.min;
+        float gmax = config.green.max;
+        float ir   = config.red.intensity   / 255.0f;
+        float ig   = config.green.intensity / 255.0f;
+        float ib   = config.blue.intensity  / 255.0f;
+        xSemaphoreGive(config.mutex);
 
-    float voltaje = ((float)adc / 4095.0) * 3.3;
-    
-    // Calcular resistencia (Evitar división por cero)
-    if (voltaje <= 0.05) return 0;
-    float resistencia = (3.3 - voltaje) * 10000.0 / voltaje;
+        if      (tc < gmin) rgb_led1_set(0, 0, ib);         //rojo ,,, verde,,,azul 
+        else if (tc < gmax) rgb_led1_set(0, ig, 0);        
+        else                rgb_led1_set(ir, 0, 0);
 
-    // Ecuación de Steinhart-Hart
-    float tempK = 1.0 / ((1.0 / 298.15) + (1.0 / 3950.0) * log(resistencia / 10000.0));
-    float tempC = tempK - 273.15;
+        // 3. Log periódico
+        ticks_log += TICK_MS;
+        xSemaphoreTake(config.mutex, portMAX_DELAY);
+        uint32_t    intv = config.print_interval_s * 1000;          // Se calcula el intervalo de impresión en milisegundos multiplicando el valor configurado en segundos por 1000, 
+        temp_unit_t unit = config.unit;
+        xSemaphoreGive(config.mutex);
 
-    printf("Temperatura Calculada: %.2f C\n", tempC);
-    return tempC; 
-}
-
-// ========================================
-// APP MAIN
-// ========================================
-
-void app_main() {
-    pwm_init();
-    
-    // Inicializar Unidad ADC1
-    adc_oneshot_unit_init_cfg_t init = {.unit_id = ADC_UNIT_1};
-    adc_oneshot_new_unit(&init, &adc_handle);
-    
-    // Configurar canales ADC (NTC en CH0, POT en CH1)
-    adc_oneshot_chan_cfg_t config = {.atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT};
-    adc_oneshot_config_channel(adc_handle, ADC_NTC, &config);
-    adc_oneshot_config_channel(adc_handle, ADC_POT, &config);
-
-    // Configurar Botón de Guardar
-    gpio_config_t io = {.mode = GPIO_MODE_INPUT, .pin_bit_mask = (1ULL << BTN_GUARDAR), .pull_up_en = 1};
-    gpio_config(&io);
-
-    int last_btn = 1;
-
-    while(1) {
-        // ====================================
-        // GESTIÓN DEL LED 1: TEMPERATURA (LÓGICA INVERTIDA)
-        // ====================================
-        float temp = leer_temperatura();
-        
-        if (temp < 25.0) {
-            set_led1_temperatura(0, 0, 1);      // Azul (< 25°C)
-        } else if (temp <= 35.0) {
-            set_led1_temperatura(0, 1, 0);      // Verde (25°C a 35°C)
-        } else {
-            set_led1_temperatura(1, 0, 0);      // Rojo (> 35°C)
+        if (ticks_log >= intv) {
+            ESP_LOGI(TAG, "Temp: %.2f °%s", convertir(tc, unit), unidad_str(unit));
+            ticks_log = 0;
         }
 
-        // ====================================
-        // GESTIÓN DEL LED 2: MEZCLADOR MANUAL (SIN CAMBIOS)
-        // ====================================
-        int val_pot;
-        adc_oneshot_read(adc_handle, ADC_POT, &val_pot);
-        float intensidad = (float)val_pot / 4095.0;
-
-        int btn = gpio_get_level(BTN_GUARDAR);
-        if(btn == 0 && last_btn == 1) {
-            vTaskDelay(pdMS_TO_TICKS(200)); // Antirebote
-            
-            if(paso == 0) r_save = intensidad;
-            else if(paso == 1) g_save = intensidad;
-            else if(paso == 2) b_save = intensidad;
-
-            paso = (paso + 1) % 4;
+        // 4. Botón — cicla unidad C→F→K→C
+        int btn = gpio_get_level(BTN_PIN);          // Lee el estado del botón
+        if (btn == 0 && last_btn == 1) {            //compara el estado actual con el anterior para definir si esta presionado si sí eeseta presionado entra al mutex para cambiar la unidad  
+            vTaskDelay(pdMS_TO_TICKS(50));
+            xSemaphoreTake(config.mutex, portMAX_DELAY);
+            if      (config.unit == UNIT_CELSIUS)    config.unit = UNIT_FAHRENHEIT;
+            else if (config.unit == UNIT_FAHRENHEIT) config.unit = UNIT_KELVIN;
+            else                                      config.unit = UNIT_CELSIUS;
+            temp_unit_t u = config.unit;
+            xSemaphoreGive(config.mutex);
+            ESP_LOGI(TAG, "Unidad → %s", unidad_str(u));
         }
         last_btn = btn;
 
-        // Actualización en tiempo real del mezclador
-        switch(paso) {
-            case 0: set_led2_mezclador(intensidad, 0, 0); break; // Ajustando Rojo
-            case 1: set_led2_mezclador(0, intensidad, 0); break; // Ajustando Verde
-            case 2: set_led2_mezclador(0, 0, intensidad); break; // Ajustando Azul
-            case 3: set_led2_mezclador(r_save, g_save, b_save); break; // Mezcla final
-        }
+        // 5. Potenciómetro — umbral de temperatura 0–100°C
+        int pot_raw = 0;                //pot_raw es una variable que se utiliza para almacenar el valor bruto leído desde el canal ADC asociado al potenciómetro, que se utiliza para determinar el umbral de temperatura en grados Celsius. Este valor se lee utilizando la función adc_oneshot_read, y luego se convierte a un rango de 0 a 100 grados Celsius para establecer el umbral de temperatura que se utilizará para controlar el estado del LED2, encendiéndolo en rojo cuando la temperatura medida supere este umbral y apagándolo cuando esté por debajo del umbral.
+        adc_oneshot_read(adc, CH_POT, &pot_raw);            //no modifca el orginal 
+        float umbral_temp = pot_raw * 100.0f / 4095.0f;
 
-        // Una pequeña pausa para que el sistema respire y el ADC sea estable
-        vTaskDelay(pdMS_TO_TICKS(30));
+        if (tc >= umbral_temp)
+            rgb_led2_set(1.0f, 0.0f, 0.0f);   // Rojo: temperatura supera umbral
+        else
+            rgb_led2_set(0.0f, 0.0f, 0.0f);   // Apagado
+
+        ESP_LOGD(TAG, "POT umbral: %.1f°C | Temp: %.1f°C", umbral_temp, tc);
+
+        vTaskDelay(pdMS_TO_TICKS(TICK_MS));         //delay de 30ms
     }
 }
